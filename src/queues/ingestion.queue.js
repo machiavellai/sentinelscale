@@ -1,5 +1,5 @@
 const {Queue} = require('bullmq')
-const redisConfig = require('../config/redis');
+const redisConfig = require('../config/RedisConfig');
 
 const ingestionQueue = new Queue('media-ingestion', {
   connection: redisConfig,

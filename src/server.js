@@ -1,4 +1,5 @@
 require("dotenv").config(); // Load environment variables from .env so PORT and other runtime settings can be configured outside code
+const uploadRoute = require('./routes/upload.route');
 
 const express = require("express");
 const http = require("http");
@@ -9,6 +10,7 @@ const server = http.createServer(app);
 
 const io = new Server(server);
 
+app.use('/api', uploadRoute);
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
