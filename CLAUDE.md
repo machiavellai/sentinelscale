@@ -5,6 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
+# Start Redis (requires Docker)
+docker-compose up -d
+
 # Start production server
 npm start
 
@@ -14,35 +17,86 @@ npm run dev
 
 No test suite or linter is configured. Redis must be running before starting the server.
 
+## First-time setup
+
+`sharp`, `piscina`, and `fluent-ffmpeg` are not in `package.json` — install them manually:
+
+```bash
+npm install express bullmq ioredis piscina socket.io sharp busboy dotenv fluent-ffmpeg --save
+npm install nodemon --save-dev
+mkdir uploads
+```
+
+`ffmpeg` binary must also be on PATH for video processing (`brew install ffmpeg` on Mac; add to Docker image for deployment).
+
 ## Environment Variables
 
 Create a `.env` file at the project root:
 
 ```
-PORT=
+PORT=3000
 REDIS_HOST=127.0.0.1
 REDIS_PORT=6379
 MAX_QUEUE_SIZE=5000      # max BullMQ waiting jobs before 503
 WORKER_THREADS=          # defaults to os.cpus().length
 ```
 
+## API
+
+- `POST /api/upload` — multipart upload. Returns `{ jobId, message }` with HTTP 202. Optional form fields alongside the file: `width`, `height`, `format` (passed as `processingOptions` to the worker). Returns 503 when queue exceeds `MAX_QUEUE_SIZE`.
+- `GET /health` — liveness check, returns `{ status: "ok" }`.
+
+## Socket.io protocol
+
+After a successful upload, clients connect to Socket.io and subscribe to progress events for their job:
+
+```js
+socket.emit('job:subscribe', jobId);         // join the room
+socket.on('job:progress',   ({ jobId, progress }) => …);  // 0–100
+socket.on('job:completed',  ({ jobId, result })   => …);
+socket.on('job:failed',     ({ jobId, reason })   => …);
+```
+
+Progress events are broadcast via `QueueEvents` (Redis pub/sub), so this works across multiple server processes — the API server doesn't need to be the same process as the BullMQ worker.
+
 ## Architecture
 
-SentinelScale is a media ingestion and processing server. The request flow is:
+SentinelScale is a high-performance media ingestion and processing server. The request flow is:
 
-1. **HTTP upload** (`POST /api/upload`) — `src/routes/upload.route.js` streams the multipart file to `uploads/` via busboy, then enqueues a BullMQ job.
-2. **BullMQ queue** (`src/queues/ingestion.queue.js`) — named `media-ingestion`, backed by Redis (ioredis). Jobs retry 3× with exponential backoff.
-3. **BullMQ worker** (`src/queues/ingestion.worker.js`) — picks up jobs at concurrency 5. For images it copies the file into a `SharedArrayBuffer` and dispatches to the image Piscina pool; for videos it dispatches the file path to the video Piscina pool.
-4. **Piscina thread pools** (`src/workers/pool.js`) — two pools: `imagePool` (full thread count) and `videoPool` (half thread count).
-   - `src/workers/image.worker.js` — uses **sharp** to resize and convert to webp (or specified format).
-   - `src/workers/video.worker.js` — uses **fluent-ffmpeg** (requires `ffmpeg` binary on PATH) to transcode to mp4 or specified format.
-5. **Socket.IO** (`src/server.js`) — wired up but only logs connections; intended for pushing job progress to clients by `jobId`.
-6. **Shared buffer util** (`src/utils/sharedBuffer.js`) — copies a Node Buffer into a `SharedArrayBuffer` with a spinlock so the image worker thread can safely read it without serialization overhead.
+1. **HTTP upload** (`src/routes/upload.route.js`) — streams the multipart file directly to `uploads/` via busboy (never buffers the full file in RAM), checks queue backpressure first, then enqueues a BullMQ job.
+2. **BullMQ queue** (`src/queues/ingestion.queue.js`) — named `media-ingestion`, backed by Redis (ioredis). Jobs retry 3× with exponential backoff; keeps last 100 completed and 500 failed.
+3. **BullMQ worker** (`src/queues/ingestion.worker.js`) — picks up jobs at concurrency 5. For images it copies the file into a `SharedArrayBuffer` and dispatches to the image Piscina pool; for videos it dispatches the file path to the video Piscina pool. Calls `job.updateProgress()` throughout.
+4. **Piscina thread pools** (`src/workers/pool.js`) — two pools: `imagePool` (full thread count) and `videoPool` (half thread count), kept separate so slow video jobs can't starve image jobs.
+   - `src/workers/image.worker.js` — uses **sharp** to resize (fit: inside, no upscale) and convert; default output format is webp.
+   - `src/workers/video.worker.js` — uses **fluent-ffmpeg** to transcode (libx264 + aac); output written to `os.tmpdir()`.
+5. **Real-time progress** (`src/sockets/progress.socket.js`) — `QueueEvents` listens to Redis pub/sub for `progress`, `completed`, and `failed` events and re-emits them to the matching Socket.io room (room = jobId).
+6. **Shared buffer util** (`src/utils/sharedBuffer.js`) — copies a Node Buffer into a `SharedArrayBuffer` with a spinlock so image worker threads can read it without serialization overhead.
 
-The `uploads/` directory must exist at the project root (the upload route writes there). The worker deletes the temp file after processing.
+`server.js` must `require('./queues/ingestion.worker')` to start the BullMQ worker on boot; without that line, jobs sit in the queue forever.
+
+The worker deletes the temp upload file after processing.
+
+## Current build state
+
+The codebase is **partially implemented**. What exists vs. what's missing:
+
+| File | Status |
+|---|---|
+| `src/server.js` | Exists but incomplete — missing `require('./queues/ingestion.worker')` and `initProgressSocket(io)` |
+| `src/config/RedisConfig.js` | Exists but filename is wrong — should be `redis.js` (lowercase); `ingestion.worker.js` already imports it as `../config/redis` which breaks on Linux |
+| `src/queues/ingestion.queue.js` | Complete |
+| `src/queues/ingestion.worker.js` | Complete |
+| `src/workers/pool.js` | Complete |
+| `src/workers/image.worker.js` | Complete |
+| `src/workers/video.worker.js` | Complete |
+| `src/utils/sharedBuffer.js` | Complete |
+| `src/routes/upload.route.js` | Complete |
+| `src/sockets/progress.socket.js` | **Missing** — needs to be created |
+| `docker-compose.yml` | **Missing** — needed to run Redis locally |
 
 ## Key Design Constraints
 
-- Image data crosses the main-thread → worker boundary via `SharedArrayBuffer` + `Atomics` spinlock (zero-copy). Don't serialize image buffers through the BullMQ job payload.
-- The `ingestion.worker.js` file in `src/queues/` is separate from the Piscina workers in `src/workers/` — the BullMQ worker is the coordinator; the Piscina workers do the CPU-bound work.
-- `ffmpeg` must be installed and on PATH for video processing to work.
+- Image data crosses the main-thread → worker boundary via `SharedArrayBuffer` + `Atomics` spinlock (zero-copy). Don't serialize image buffers through the BullMQ job payload — a 50MB image × multiple workers would clone hundreds of MB.
+- The `ingestion.worker.js` in `src/queues/` is the coordinator (BullMQ); the files in `src/workers/` are the CPU workers (Piscina). They are separate layers.
+- BullMQ requires `maxRetriesPerRequest: null` on the ioredis config — leaving it at the ioredis default (20) causes BullMQ to throw on startup.
+- Two separate Piscina pools (image vs. video) prevent slow video transcodes from blocking image processing.
