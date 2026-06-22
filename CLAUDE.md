@@ -76,24 +76,6 @@ SentinelScale is a high-performance media ingestion and processing server. The r
 
 The worker deletes the temp upload file after processing.
 
-## Current build state
-
-The codebase is **partially implemented**. What exists vs. what's missing:
-
-| File | Status |
-|---|---|
-| `src/server.js` | Exists but incomplete — missing `require('./queues/ingestion.worker')` and `initProgressSocket(io)` |
-| `src/config/RedisConfig.js` | Exists but filename is wrong — should be `redis.js` (lowercase); `ingestion.worker.js` already imports it as `../config/redis` which breaks on Linux |
-| `src/queues/ingestion.queue.js` | Complete |
-| `src/queues/ingestion.worker.js` | Complete |
-| `src/workers/pool.js` | Complete |
-| `src/workers/image.worker.js` | Complete |
-| `src/workers/video.worker.js` | Complete |
-| `src/utils/sharedBuffer.js` | Complete |
-| `src/routes/upload.route.js` | Complete |
-| `src/sockets/progress.socket.js` | **Missing** — needs to be created |
-| `docker-compose.yml` | **Missing** — needed to run Redis locally |
-
 ## Key Design Constraints
 
 - Image data crosses the main-thread → worker boundary via `SharedArrayBuffer` + `Atomics` spinlock (zero-copy). Don't serialize image buffers through the BullMQ job payload — a 50MB image × multiple workers would clone hundreds of MB.
