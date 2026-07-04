@@ -4,6 +4,8 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const uploadRoute = require('./routes/upload.route');
+const { initProgressSocket } = require('./sockets/progress.socket');
+require('./queues/ingestion.worker');
 
 const app = express();
 const server = http.createServer(app);
@@ -15,9 +17,7 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-io.on("connection", (socket) => {
-  console.log("Client connected:", socket.id);
-});
+initProgressSocket(io);
 
 const PORT = process.env.PORT 
 

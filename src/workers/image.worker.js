@@ -15,8 +15,11 @@ module.exports = async function processImage({ sab, lockSab, jobId, options }) {
 
   const pipeline = sharp(inputBuffer);
 
-  if (options.width || options.height) {
-    pipeline.resize(options.width, options.height, {
+  const width = options.width ? parseInt(options.width, 10) : undefined;
+  const height = options.height ? parseInt(options.height, 10) : undefined;
+
+  if (width || height) {
+    pipeline.resize(width, height, {
       fit: 'inside',
       withoutEnlargement: true,
     });

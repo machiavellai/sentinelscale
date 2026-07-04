@@ -1,39 +1,41 @@
-'use strict';
+"use strict";
 
-const { Worker } = require('bullmq');
-const fs = require('fs');
-const redisConfig = require('../config/redis');
-const { imagePool, videoPool } = require('../workers/pool');
-const { toSharedBuffer } = require('../utils/sharedBuffer');
+const { Worker } = require("bullmq");
+const fs = require("fs");
+const path = require("path");
+const redisConfig = require("../config/RedisConfig");
+const { imagePool, videoPool } = require("../workers/pool");
+const { toSharedBuffer } = require("../utils/sharedBuffer");
+
+const PROCESSED_DIR = path.resolve(__dirname, "../../processed");
 
 const ingestionWorker = new Worker(
-  'media-ingestion',
+  "media-ingestion",
   async (job) => {
     const { filePath, fileType, jobId, options } = job.data;
 
     await job.updateProgress(5);
 
-    const fileBuffer = fs.readFileSync(filePath);
-    await job.updateProgress(15);
-
     let result;
 
-    if (fileType === 'image') {
+    if (fileType === "image") {
+      const fileBuffer = fs.readFileSync(filePath);
       const sab = toSharedBuffer(fileBuffer);
+      
       const lockSab = new SharedArrayBuffer(4);
 
       await job.updateProgress(20);
 
-      result = await imagePool.run({
-        sab,
-        lockSab,
-        jobId,
-        options,
-      });
-
+      const rawResult = await imagePool.run({ sab, lockSab, jobId, options });
       await job.updateProgress(90);
-    } else if (fileType === 'video') {
-      result = await videoPool.run({ inputPath: filePath, jobId, options });
+
+      const outputPath = path.join(PROCESSED_DIR, `${jobId}.${rawResult.format}`);
+      fs.writeFileSync(outputPath, rawResult.data);
+      result = { jobId, outputPath, format: rawResult.format, byteLength: rawResult.byteLength };
+
+    } else if (fileType === "video") {
+      const outputPath = path.join(PROCESSED_DIR, `${jobId}.${options.format || "mp4"}`);
+      result = await videoPool.run({ inputPath: filePath, jobId, options, outputPath });
       await job.updateProgress(90);
     } else {
       throw new Error(`Unknown fileType: ${fileType}`);
@@ -47,19 +49,19 @@ const ingestionWorker = new Worker(
   {
     connection: redisConfig,
     concurrency: 5,
-  }
+  },
 );
 
-ingestionWorker.on('completed', (job) => {
+ingestionWorker.on("completed", (job) => {
   console.log(`Job ${job.id} completed`);
 });
 
-ingestionWorker.on('failed', (job, err) => {
+ingestionWorker.on("failed", (job, err) => {
   console.error(`Job ${job && job.id} failed: ${err.message}`);
 });
 
-ingestionWorker.on('error', (err) => {
-  console.error('Worker error:', err);
+ingestionWorker.on("error", (err) => {
+  console.error("Worker error:", err);
 });
 
 module.exports = ingestionWorker;

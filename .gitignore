@@ -4,3 +4,5 @@ build/
 .env
 .env.*
 CLAUDE.local.md
+uploads/
+processed/
