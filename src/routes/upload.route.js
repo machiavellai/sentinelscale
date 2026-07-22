@@ -27,6 +27,7 @@ const MAX_DELAY_MS = parseInt(process.env.MAX_DELAY_MS, 10) || 24 * 60 * 60 * 10
 
 router.post('/upload', async (req, res) => {
   try {
+    //asking BullMQ for the current number of jobs in the "waiting" state (i.e. jobs
     const waitingCount = await ingestionQueue.getWaitingCount();
 
     if (waitingCount >= MAX_QUEUE_SIZE) {
@@ -41,7 +42,37 @@ router.post('/upload', async (req, res) => {
 
     let savedFilePath = null;
     let fileType = null;
+    let responded = false;
+    let fileWritten = Promise.resolve();
     const processingOptions = {};
+
+    // busboy keeps parsing the rest of the multipart body even after an
+    // earlier handler has already sent a response (e.g. an unsupported MIME
+    // type or a write-stream error) - 'finish' still fires afterward and
+    // would otherwise try to send a second response, which throws
+    // ERR_HTTP_HEADERS_SENT. This guard makes every response site a no-op
+    // once one response has gone out.
+    function respond(status, body) {
+      if (responded) return;
+      responded = true;
+      res.status(status).json(body);
+    }
+
+    // Scheduling validation runs in 'finish', after the file has already been
+    // written to disk. Rejecting at that point without removing the file
+    // would leave it orphaned forever - no BullMQ job gets created, so the
+    // worker (which normally deletes the temp upload after processing) never
+    // runs to clean it up.
+    function respondAndCleanup(status, body) {
+      if (savedFilePath) {
+        fs.unlink(savedFilePath, (err) => {
+          if (err && err.code !== 'ENOENT') {
+            console.error('Failed to remove orphaned upload:', err);
+          }
+        });
+      }
+      respond(status, body);
+    }
     // `delay` and `processAt` are scheduling instructions for BullMQ, not
     // processing instructions for sharp/ffmpeg - so we keep them in their own
     // object instead of mixing them into `processingOptions` (which gets
@@ -58,9 +89,8 @@ router.post('/upload', async (req, res) => {
         fileType = 'video';
       } else {
         fileStream.resume();
-        return res.status(415).json({
-          error: `Unsupported media type: ${mimeType}`,
-        });
+        respond(415, { error: `Unsupported media type: ${mimeType}` });
+        return;
       }
 
       const ext = path.extname(filename) || '.bin';
@@ -69,9 +99,18 @@ router.post('/upload', async (req, res) => {
       const writeStream = fs.createWriteStream(savedFilePath);
       fileStream.pipe(writeStream);
 
-      writeStream.on('error', (err) => {
-        console.error('File write error:', err);
-        return res.status(500).json({ error: 'Failed to save upload' });
+      // busboy's 'finish' fires once it's done parsing the request body,
+      // which can happen before this writeStream has actually flushed to
+      // disk. Scheduling validation (and any cleanup unlink) needs to wait
+      // for the real write to complete first - otherwise an unlink can race
+      // ahead of file creation and silently no-op, leaving the file orphaned.
+      fileWritten = new Promise((resolve) => {
+        writeStream.on('finish', resolve);
+        writeStream.on('error', (err) => {
+          console.error('File write error:', err);
+          respond(500, { error: 'Failed to save upload' });
+          resolve();
+        });
       });
     });
 
@@ -87,10 +126,11 @@ router.post('/upload', async (req, res) => {
     });
 
     bb.on('finish', async () => {
+      await fileWritten;
+      if (responded) return;
+
       if (!savedFilePath || !fileType) {
-        return res.status(400).json({
-          error: 'No valid media file was uploaded.',
-        });
+        return respond(400, { error: 'No valid media file was uploaded.' });
       }
 
       // A client can schedule a job in one of two equivalent ways:
@@ -100,9 +140,7 @@ router.post('/upload', async (req, res) => {
       // have to decide which one wins, which is just a source of confusing
       // bugs, so we simply reject the request instead.
       if (scheduling.delay !== undefined && scheduling.processAt !== undefined) {
-        return res.status(400).json({
-          error: 'Provide either "delay" or "processAt", not both.',
-        });
+        return respondAndCleanup(400, { error: 'Provide either "delay" or "processAt", not both.' });
       }
 
       // `delayMs` is what we'll actually hand to BullMQ. It always starts at
@@ -116,9 +154,7 @@ router.post('/upload', async (req, res) => {
         // have to check for NaN explicitly with Number.isFinite - a plain
         // `if (!delayMs)` would NOT catch this case.
         if (!Number.isFinite(delayMs) || !Number.isInteger(delayMs)) {
-          return res.status(400).json({
-            error: '"delay" must be an integer number of milliseconds.',
-          });
+          return respondAndCleanup(400, { error: '"delay" must be an integer number of milliseconds.' });
         }
       } else if (scheduling.processAt !== undefined) {
         // Date.parse gives us the target time as milliseconds-since-epoch.
@@ -127,7 +163,7 @@ router.post('/upload', async (req, res) => {
         // actually understands.
         const targetTimestamp = Date.parse(scheduling.processAt);
         if (Number.isNaN(targetTimestamp)) {
-          return res.status(400).json({
+          return respondAndCleanup(400, {
             error: '"processAt" must be a valid date/time string (e.g. an ISO 8601 timestamp).',
           });
         }
@@ -140,15 +176,11 @@ router.post('/upload', async (req, res) => {
       //     input) both result in a negative `delayMs` here, so one check
       //     catches both.
       if (delayMs < 0) {
-        return res.status(400).json({
-          error: 'Scheduled time must be in the future.',
-        });
+        return respondAndCleanup(400, { error: 'Scheduled time must be in the future.' });
       }
 
       if (delayMs > MAX_DELAY_MS) {
-        return res.status(400).json({
-          error: `Cannot schedule more than ${MAX_DELAY_MS}ms into the future.`,
-        });
+        return respondAndCleanup(400, { error: `Cannot schedule more than ${MAX_DELAY_MS}ms into the future.` });
       }
 
       await ingestionQueue.add(
@@ -174,12 +206,12 @@ router.post('/upload', async (req, res) => {
         response.message = `Upload accepted and scheduled to process at ${response.scheduledFor}.`;
       }
 
-      return res.status(202).json(response);
+      return respond(202, response);
     });
 
     bb.on('error', (err) => {
       console.error('Upload parsing error:', err);
-      return res.status(500).json({ error: 'Upload failed' });
+      respond(500, { error: 'Upload failed' });
     });
 
     req.pipe(bb);
