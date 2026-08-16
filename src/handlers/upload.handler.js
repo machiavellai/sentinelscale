@@ -157,7 +157,7 @@ async function handleUpload(req, res) {
       writeStream.on('finish', resolve);
       writeStream.on('error', (err) => {
         console.error('File write error:', err);
-        respond(500, { error: 'Failed to save upload' });
+        respondAndCleanup(500, { error: 'Failed to save upload' });
         resolve();
       });
     });
@@ -225,7 +225,7 @@ async function handleUpload(req, res) {
 
   bb.on('error', (err) => {
     console.error('Upload parsing error:', err);
-    respond(500, { error: 'Upload failed' });
+    respondAndCleanup(500, { error: 'Upload failed' });
   });
 
   req.pipe(bb);
