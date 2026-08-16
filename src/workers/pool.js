@@ -19,7 +19,7 @@ const imagePool = new Piscina({
 const videoPool = new Piscina({
   filename: path.resolve(__dirname, 'video.worker.js'),
   maxThreads: Math.max(1, Math.floor(maxThreads / 2)),
-  idleTimeout: 60000,
+  idleTimeout: 70000,
 });
 
 module.exports = { imagePool, videoPool };

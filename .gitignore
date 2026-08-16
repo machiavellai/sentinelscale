@@ -3,3 +3,8 @@ dist/
 build/
 .env
 .env.*
+CLAUDE.local.md
+uploads/
+processed/
+.claude/
+.SentinelScale-Architecture.docx
