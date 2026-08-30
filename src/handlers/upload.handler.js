@@ -1,12 +1,12 @@
-'use strict';
+"use strict";
 
-const path = require('path');
-const fs = require('fs');
-const busboy = require('busboy');
-const { randomUUID } = require('crypto');
-const ingestionQueue = require('../queues/ingestion.queue');
+const path = require("path");
+const fs = require("fs");
+const busboy = require("busboy");
+const { randomUUID } = require("crypto");
+const ingestionQueue = require("../queues/ingestion.queue");
 
-const UPLOADS_DIR = path.resolve(__dirname, '../../uploads');
+const UPLOADS_DIR = path.resolve(__dirname, "../../uploads");
 
 // How BullMQ delay works: when you call `queue.add(name, data, { delay: <ms> })`,
 // BullMQ does NOT run the job right away. It stores the job in a special Redis
@@ -20,13 +20,49 @@ const UPLOADS_DIR = path.resolve(__dirname, '../../uploads');
 // on disk on our server for 10 years doing nothing but taking up space. This
 // is configurable via env var so ops can tune it without a code change, same
 // pattern as MAX_QUEUE_SIZE in upload.route.js.
-const MAX_DELAY_MS = parseInt(process.env.MAX_DELAY_MS, 10) || 24 * 60 * 60 * 1000; // default: 24 hours
+const MAX_DELAY_MS =
+  parseInt(process.env.MAX_DELAY_MS, 10) || 24 * 60 * 60 * 1000; // default: 24 hours
+
+// BullMQ's own default: priority 0 means "unprioritized", processed FIFO
+// alongside every other unprioritized job. Anything >= 1 enters the ordered
+// "prioritized" set (1 beats 2 beats 3...). We cap the client-facing range
+// well below BullMQ's internal max (2,097,152) since we don't need that much
+// resolution - 10 tiers is plenty to express "urgent" vs "normal" vs "batch".
+const MIN_PRIORITY = 0;
+const MAX_PRIORITY = 10;
 
 class ScheduleValidationError extends Error {
   constructor(message) {
     super(message);
     this.status = 400; // every scheduling failure is a 400
   }
+}
+
+class PriorityValidationError extends Error {
+  constructor(message) {
+    super(message);
+    this.status = 400; // every priority failure is a 400
+  }
+}
+
+function resolvePriority(priority) {
+  if (priority === undefined || priority === null) {
+    return MIN_PRIORITY;
+  }
+
+  const priorityValue = Number(priority);
+
+  if (!Number.isFinite(priorityValue) || !Number.isInteger(priorityValue)) {
+    throw new PriorityValidationError('"priority" must be an integer number.');
+  }
+
+  if (priorityValue < MIN_PRIORITY || priorityValue > MAX_PRIORITY) {
+    throw new PriorityValidationError(
+      `"priority" must be between ${MIN_PRIORITY} and ${MAX_PRIORITY}.`,
+    );
+  }
+
+  return priorityValue;
 }
 
 // `scheduling` is `{ delay?: string, processAt?: string }` as collected off
@@ -39,7 +75,9 @@ function resolveScheduleDelay(scheduling) {
   // have to decide which one wins, which is just a source of confusing
   // bugs, so we simply reject the request instead.
   if (scheduling.delay !== undefined && scheduling.processAt !== undefined) {
-    throw new ScheduleValidationError('Provide either "delay" or "processAt", not both.');
+    throw new ScheduleValidationError(
+      'Provide either "delay" or "processAt", not both.',
+    );
   }
 
   // `delayMs` is what we'll actually hand to BullMQ. It always starts at
@@ -53,7 +91,9 @@ function resolveScheduleDelay(scheduling) {
     // have to check for NaN explicitly with Number.isFinite - a plain
     // `if (!delayMs)` would NOT catch this case.
     if (!Number.isFinite(delayMs) || !Number.isInteger(delayMs)) {
-      throw new ScheduleValidationError('"delay" must be an integer number of milliseconds.');
+      throw new ScheduleValidationError(
+        '"delay" must be an integer number of milliseconds.',
+      );
     }
   } else if (scheduling.processAt !== undefined) {
     // Date.parse gives us the target time as milliseconds-since-epoch.
@@ -63,7 +103,7 @@ function resolveScheduleDelay(scheduling) {
     const targetTimestamp = Date.parse(scheduling.processAt);
     if (Number.isNaN(targetTimestamp)) {
       throw new ScheduleValidationError(
-        '"processAt" must be a valid date/time string (e.g. an ISO 8601 timestamp).'
+        '"processAt" must be a valid date/time string (e.g. an ISO 8601 timestamp).',
       );
     }
     delayMs = targetTimestamp - Date.now();
@@ -75,11 +115,13 @@ function resolveScheduleDelay(scheduling) {
   //     input) both result in a negative `delayMs` here, so one check
   //     catches both.
   if (delayMs < 0) {
-    throw new ScheduleValidationError('Scheduled time must be in the future.');
+    throw new ScheduleValidationError("Scheduled time must be in the future.");
   }
 
   if (delayMs > MAX_DELAY_MS) {
-    throw new ScheduleValidationError(`Cannot schedule more than ${MAX_DELAY_MS}ms into the future.`);
+    throw new ScheduleValidationError(
+      `Cannot schedule more than ${MAX_DELAY_MS}ms into the future.`,
+    );
   }
 
   return delayMs;
@@ -121,28 +163,28 @@ async function handleUpload(req, res) {
   function respondAndCleanup(status, body) {
     if (savedFilePath) {
       fs.unlink(savedFilePath, (err) => {
-        if (err && err.code !== 'ENOENT') {
-          console.error('Failed to remove orphaned upload:', err);
+        if (err && err.code !== "ENOENT") {
+          console.error("Failed to remove orphaned upload:", err);
         }
       });
     }
     respond(status, body);
   }
 
-  bb.on('file', (fieldname, fileStream, info) => {
+  bb.on("file", (fieldname, fileStream, info) => {
     const { filename, mimeType } = info;
 
-    if (mimeType.startsWith('image/')) {
-      fileType = 'image';
-    } else if (mimeType.startsWith('video/')) {
-      fileType = 'video';
+    if (mimeType.startsWith("image/")) {
+      fileType = "image";
+    } else if (mimeType.startsWith("video/")) {
+      fileType = "video";
     } else {
       fileStream.resume();
       respond(415, { error: `Unsupported media type: ${mimeType}` });
       return;
     }
 
-    const ext = path.extname(filename) || '.bin';
+    const ext = path.extname(filename) || ".bin";
     savedFilePath = path.join(UPLOADS_DIR, `${jobId}${ext}`);
 
     const writeStream = fs.createWriteStream(savedFilePath);
@@ -154,32 +196,38 @@ async function handleUpload(req, res) {
     // for the real write to complete first - otherwise an unlink can race
     // ahead of file creation and silently no-op, leaving the file orphaned.
     fileWritten = new Promise((resolve) => {
-      writeStream.on('finish', resolve);
-      writeStream.on('error', (err) => {
-        console.error('File write error:', err);
-        respondAndCleanup(500, { error: 'Failed to save upload' });
+      writeStream.on("finish", resolve);
+      writeStream.on("error", (err) => {
+        console.error("File write error:", err);
+        respondAndCleanup(500, { error: "Failed to save upload" });
         resolve();
       });
     });
   });
 
-  bb.on('field', (name, value) => {
-    // Route the two scheduling fields into `scheduling`; everything else
-    // (width, height, format, ...) keeps going into `processingOptions` like
-    // it always has.
-    if (name === 'delay' || name === 'processAt') {
+  let rawPriority;
+
+  bb.on("field", (name, value) => {
+    // Route control fields (scheduling + priority) away from `processingOptions`;
+    // everything else (width, height, format, ...) keeps going into
+    // `processingOptions` like it always has. `priority` is a BullMQ job option,
+    // not a sharp/ffmpeg setting, so it can't be allowed to leak into `options`
+    // the way it would if it just fell into the `else` branch below.
+    if (name === "delay" || name === "processAt") {
       scheduling[name] = value;
+    } else if (name === "priority") {
+      rawPriority = value;
     } else {
       processingOptions[name] = value;
     }
   });
 
-  bb.on('finish', async () => {
+  bb.on("finish", async () => {
     await fileWritten;
     if (responded) return;
 
     if (!savedFilePath || !fileType) {
-      return respond(400, { error: 'No valid media file was uploaded.' });
+      return respond(400, { error: "No valid media file was uploaded." });
     }
 
     // `resolveScheduleDelay` can throw `ScheduleValidationError`. This
@@ -189,21 +237,22 @@ async function handleUpload(req, res) {
     // same catch-log-respond convention as `bb.on('error', ...)` below.
     try {
       const delayMs = resolveScheduleDelay(scheduling);
+      const priority = resolvePriority(rawPriority);
 
       await ingestionQueue.add(
-        'process-media',
+        "process-media",
         {
           filePath: savedFilePath,
           fileType,
           jobId,
           options: processingOptions,
         },
-        { jobId, delay: delayMs }
+        { jobId, delay: delayMs, priority },
       );
 
       const response = {
         jobId,
-        message: 'Upload accepted. Subscribe to this jobId for progress.',
+        message: "Upload accepted. Subscribe to this jobId for progress.",
       };
 
       // Only mention scheduling in the response when a delay actually applies -
@@ -215,17 +264,20 @@ async function handleUpload(req, res) {
 
       return respond(202, response);
     } catch (err) {
-      if (err instanceof ScheduleValidationError) {
+      if (
+        err instanceof ScheduleValidationError ||
+        err instanceof PriorityValidationError
+      ) {
         return respondAndCleanup(400, { error: err.message });
       }
-      console.error('Upload finish handler error:', err);
-      return respondAndCleanup(500, { error: 'Server error during upload' });
+      console.error("Upload finish handler error:", err);
+      return respondAndCleanup(500, { error: "Server error during upload" });
     }
   });
 
-  bb.on('error', (err) => {
-    console.error('Upload parsing error:', err);
-    respondAndCleanup(500, { error: 'Upload failed' });
+  bb.on("error", (err) => {
+    console.error("Upload parsing error:", err);
+    respondAndCleanup(500, { error: "Upload failed" });
   });
 
   req.pipe(bb);
