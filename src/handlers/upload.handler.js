@@ -10,26 +10,11 @@ const { detectStreamType } = require("../utils/fileTypeDetector");
 const UPLOADS_DIR = path.resolve(__dirname, "../../uploads");
 fs.mkdirSync(UPLOADS_DIR, { recursive: true, mode: 0o750 });
 
-// How BullMQ delay works: when you call `queue.add(name, data, { delay: <ms> })`,
-// BullMQ does NOT run the job right away. It stores the job in a special Redis
-// sorted set (the "delayed" set), scored by the timestamp `now + delay`. A job
-// only becomes eligible for a worker to pick up once that timestamp has passed.
-// So `delay` is "how many milliseconds from now should this job start waiting
-// in line" - it is NOT how long the job itself takes to run.
-//
-// We cap how far into the future someone can schedule a job. Without a cap,
-// a client could schedule a job 10 years out, and its uploaded file would sit
-// on disk on our server for 10 years doing nothing but taking up space. This
-// is configurable via env var so ops can tune it without a code change, same
-// pattern as MAX_QUEUE_SIZE in upload.route.js.
+// `delay` schedules a job N ms from now; capped so files don't sit on disk indefinitely.
 const MAX_DELAY_MS =
   parseInt(process.env.MAX_DELAY_MS, 10) || 24 * 60 * 60 * 1000; // default: 24 hours
 
-// BullMQ's own default: priority 0 means "unprioritized", processed FIFO
-// alongside every other unprioritized job. Anything >= 1 enters the ordered
-// "prioritized" set (1 beats 2 beats 3...). We cap the client-facing range
-// well below BullMQ's internal max (2,097,152) since we don't need that much
-// resolution - 10 tiers is plenty to express "urgent" vs "normal" vs "batch".
+// BullMQ priority: 0 = unprioritized/FIFO, 1-10 = ordered tiers (1 beats 2 beats 3...).
 const MIN_PRIORITY = 0;
 const MAX_PRIORITY = 10;
 
@@ -67,41 +52,24 @@ function resolvePriority(priority) {
   return priorityValue;
 }
 
-// `scheduling` is `{ delay?: string, processAt?: string }` as collected off
-// busboy fields - both always strings off the wire, never pre-parsed.
+// Accepts either `delay` (ms from now) or `processAt` (ISO timestamp), not both.
 function resolveScheduleDelay(scheduling) {
-  // A client can schedule a job in one of two equivalent ways:
-  //   - `delay`: "start this job N milliseconds from now"     e.g. delay=15000
-  //   - `processAt`: "start this job at this exact timestamp" e.g. processAt=2026-07-04T09:00:00Z
-  // Only one should be used at a time - allowing both would mean we'd
-  // have to decide which one wins, which is just a source of confusing
-  // bugs, so we simply reject the request instead.
   if (scheduling.delay !== undefined && scheduling.processAt !== undefined) {
     throw new ScheduleValidationError(
       'Provide either "delay" or "processAt", not both.',
     );
   }
 
-  // `delayMs` is what we'll actually hand to BullMQ. It always starts at
-  // 0, meaning "no delay, process as soon as a worker is free" - which is
-  // exactly today's existing behavior when neither field is sent.
   let delayMs = 0;
 
   if (scheduling.delay !== undefined) {
     delayMs = Number(scheduling.delay);
-    // `Number('abc')` is NaN, and NaN comparisons are always false, so we
-    // have to check for NaN explicitly with Number.isFinite - a plain
-    // `if (!delayMs)` would NOT catch this case.
     if (!Number.isFinite(delayMs) || !Number.isInteger(delayMs)) {
       throw new ScheduleValidationError(
         '"delay" must be an integer number of milliseconds.',
       );
     }
   } else if (scheduling.processAt !== undefined) {
-    // Date.parse gives us the target time as milliseconds-since-epoch.
-    // Subtracting "now" converts "run at this clock time" into "run in
-    // this many milliseconds from now", which is the only form BullMQ
-    // actually understands.
     const targetTimestamp = Date.parse(scheduling.processAt);
     if (Number.isNaN(targetTimestamp)) {
       throw new ScheduleValidationError(
@@ -111,11 +79,6 @@ function resolveScheduleDelay(scheduling) {
     delayMs = targetTimestamp - Date.now();
   }
 
-  // One validation step covers both scheduling styles at once:
-  //   - a negative `delay` (someone asked to go back in time), and
-  //   - a `processAt` that's already in the past (same problem, different
-  //     input) both result in a negative `delayMs` here, so one check
-  //     catches both.
   if (delayMs < 0) {
     throw new ScheduleValidationError("Scheduled time must be in the future.");
   }
@@ -138,30 +101,16 @@ async function handleUpload(req, res) {
   let responded = false;
   let fileWritten = Promise.resolve();
   const processingOptions = {};
-  // `delay` and `processAt` are scheduling instructions for BullMQ, not
-  // processing instructions for sharp/ffmpeg - so we keep them in their own
-  // object instead of mixing them into `processingOptions` (which gets
-  // forwarded straight into the Piscina worker pools further down the
-  // pipeline and shouldn't have to know/care about scheduling fields).
-  const scheduling = {};
+  const scheduling = {}; // BullMQ scheduling fields, kept separate from processingOptions
 
-  // busboy keeps parsing the rest of the multipart body even after an
-  // earlier handler has already sent a response (e.g. an unsupported MIME
-  // type or a write-stream error) - 'finish' still fires afterward and
-  // would otherwise try to send a second response, which throws
-  // ERR_HTTP_HEADERS_SENT. This guard makes every response site a no-op
-  // once one response has gone out.
+  // Guards every response site so a second response after one already sent is a no-op.
   function respond(status, body) {
     if (responded) return;
     responded = true;
     res.status(status).json(body);
   }
 
-  // Scheduling validation runs in 'finish', after the file has already been
-  // written to disk. Rejecting at that point without removing the file
-  // would leave it orphaned forever - no BullMQ job gets created, so the
-  // worker (which normally deletes the temp upload after processing) never
-  // runs to clean it up.
+  // Removes an orphaned upload before responding, so a rejected/failed request doesn't leak disk space.
   function respondAndCleanup(status, body) {
     if (savedFilePath) {
       fs.unlink(savedFilePath, (err) => {
@@ -175,12 +124,12 @@ async function handleUpload(req, res) {
 
   bb.on("file", (fieldname, fileStream, info) => {
     const { filename } = info;
-    // `info.mimeType` (client-supplied) is deliberately not trusted for routing anymore - detectStreamType sniffs real magic bytes instead.
+    // `info.mimeType` is client-supplied and not trusted for routing - detectStreamType sniffs real magic bytes instead.
 
     const ext = path.extname(filename) || ".bin";
     savedFilePath = path.join(UPLOADS_DIR, `${jobId}${ext}`);
 
-    // Detection is async, so the rest of the per-file logic now lives in this IIFE; its promise IS `fileWritten` (bb.on("finish") below is unchanged).
+    // Detection is async, so the rest of the per-file logic lives in this IIFE; its promise IS `fileWritten`.
     fileWritten = (async () => {
       try {
         const detectedStream = await detectStreamType(fileStream);
@@ -223,11 +172,7 @@ async function handleUpload(req, res) {
   let rawPriority;
 
   bb.on("field", (name, value) => {
-    // Route control fields (scheduling + priority) away from `processingOptions`;
-    // everything else (width, height, format, ...) keeps going into
-    // `processingOptions` like it always has. `priority` is a BullMQ job option,
-    // not a sharp/ffmpeg setting, so it can't be allowed to leak into `options`
-    // the way it would if it just fell into the `else` branch below.
+    // Scheduling/priority fields are routed away from processingOptions, which is forwarded as-is to the Piscina workers.
     if (name === "delay" || name === "processAt") {
       scheduling[name] = value;
     } else if (name === "priority") {
@@ -245,11 +190,6 @@ async function handleUpload(req, res) {
       return respond(400, { error: "No valid media file was uploaded." });
     }
 
-    // `resolveScheduleDelay` can throw `ScheduleValidationError`. This
-    // callback is a detached async event listener - nothing awaits it - so
-    // a throw here never reaches handleUpload's caller. Every failure path
-    // has to be caught and turned into a response right here, mirroring the
-    // same catch-log-respond convention as `bb.on('error', ...)` below.
     try {
       const delayMs = resolveScheduleDelay(scheduling);
       const priority = resolvePriority(rawPriority);
@@ -270,8 +210,6 @@ async function handleUpload(req, res) {
         message: "Upload accepted. Subscribe to this jobId for progress.",
       };
 
-      // Only mention scheduling in the response when a delay actually applies -
-      // no point telling the client "scheduled for right now."
       if (delayMs > 0) {
         response.scheduledFor = new Date(Date.now() + delayMs).toISOString();
         response.message = `Upload accepted and scheduled to process at ${response.scheduledFor}.`;
