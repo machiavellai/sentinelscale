@@ -133,11 +133,11 @@ Create a `.env` file at the project root:
 | `WORKER_THREADS`  | optional | `os.cpus().length`     | Thread count for the image Piscina pool (video pool uses half of this).  |
 
 ```env
-PORT=3000
-REDIS_HOST=127.0.0.1
-REDIS_PORT=6379
-MAX_QUEUE_SIZE=5000
-MAX_DELAY_MS=86400000
+PORT=****
+REDIS_HOST=******
+REDIS_PORT=*****
+MAX_QUEUE_SIZE=*******
+MAX_DELAY_MS=********
 WORKER_THREADS=
 ```
 
