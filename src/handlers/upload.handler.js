@@ -5,8 +5,10 @@ const fs = require("fs");
 const busboy = require("busboy");
 const { randomUUID } = require("crypto");
 const ingestionQueue = require("../queues/ingestion.queue");
+const { detectStreamType } = require("../utils/fileTypeDetector");
 
 const UPLOADS_DIR = path.resolve(__dirname, "../../uploads");
+fs.mkdirSync(UPLOADS_DIR, { recursive: true, mode: 0o750 });
 
 // How BullMQ delay works: when you call `queue.add(name, data, { delay: <ms> })`,
 // BullMQ does NOT run the job right away. It stores the job in a special Redis
@@ -172,37 +174,50 @@ async function handleUpload(req, res) {
   }
 
   bb.on("file", (fieldname, fileStream, info) => {
-    const { filename, mimeType } = info;
-
-    if (mimeType.startsWith("image/")) {
-      fileType = "image";
-    } else if (mimeType.startsWith("video/")) {
-      fileType = "video";
-    } else {
-      fileStream.resume();
-      respond(415, { error: `Unsupported media type: ${mimeType}` });
-      return;
-    }
+    const { filename } = info;
+    // `info.mimeType` (client-supplied) is deliberately not trusted for routing anymore - detectStreamType sniffs real magic bytes instead.
 
     const ext = path.extname(filename) || ".bin";
     savedFilePath = path.join(UPLOADS_DIR, `${jobId}${ext}`);
 
-    const writeStream = fs.createWriteStream(savedFilePath);
-    fileStream.pipe(writeStream);
+    // Detection is async, so the rest of the per-file logic now lives in this IIFE; its promise IS `fileWritten` (bb.on("finish") below is unchanged).
+    fileWritten = (async () => {
+      try {
+        const detectedStream = await detectStreamType(fileStream);
+        const sniffedMime = detectedStream.fileType?.mime;
 
-    // busboy's 'finish' fires once it's done parsing the request body,
-    // which can happen before this writeStream has actually flushed to
-    // disk. Scheduling validation (and any cleanup unlink) needs to wait
-    // for the real write to complete first - otherwise an unlink can race
-    // ahead of file creation and silently no-op, leaving the file orphaned.
-    fileWritten = new Promise((resolve) => {
-      writeStream.on("finish", resolve);
-      writeStream.on("error", (err) => {
-        console.error("File write error:", err);
-        respondAndCleanup(500, { error: "Failed to save upload" });
-        resolve();
-      });
-    });
+        if (!sniffedMime) {
+          detectedStream.resume();
+          respond(415, { error: "Could not verify file type." });
+          return;
+        }
+
+        if (sniffedMime.startsWith("image/")) {
+          fileType = "image";
+        } else if (sniffedMime.startsWith("video/")) {
+          fileType = "video";
+        } else {
+          detectedStream.resume();
+          respond(415, { error: `Unsupported media type: ${sniffedMime}` });
+          return;
+        }
+
+        const writeStream = fs.createWriteStream(savedFilePath);
+        detectedStream.pipe(writeStream);
+
+        await new Promise((resolve) => {
+          writeStream.on("finish", resolve);
+          writeStream.on("error", (err) => {
+            console.error("File write error:", err);
+            respondAndCleanup(500, { error: "Failed to save upload" });
+            resolve();
+          });
+        });
+      } catch (err) {
+        console.error("File type detection error:", err);
+        respondAndCleanup(500, { error: "Failed to process upload." });
+      }
+    })();
   });
 
   let rawPriority;

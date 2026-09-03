@@ -8,6 +8,7 @@ const { imagePool, videoPool } = require("../workers/pool");
 const { toSharedBuffer } = require("../utils/sharedBuffer");
 
 const PROCESSED_DIR = path.resolve(__dirname, "../../processed");
+fs.mkdirSync(PROCESSED_DIR, { recursive: true, mode: 0o750 });
 
 const ingestionWorker = new Worker(
   "media-ingestion",
